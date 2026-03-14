@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { cdpPaymentMiddleware } from "x402-cdp";
-import { describeRoute, openAPIRouteHandler } from "hono-openapi";
+import { extractParams } from "x402-ai";
+import { openapiFromMiddleware } from "x402-openapi";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -174,120 +175,87 @@ function getProvider(env: Env): GPUProvider {
   return provider;
 }
 
-// === OpenAPI spec — must be before paymentMiddleware ===
+// === Route config ===
 
-app.get("/.well-known/openapi.json", openAPIRouteHandler(app, {
-  documentation: {
-    info: {
-      title: "x402 GPU Service",
-      description: "On-demand GPU instances via RunPod. Pay via x402, get a GPU pod. Pay-per-use via x402 protocol on Base mainnet.",
-      version: "1.0.0",
+const SYSTEM_PROMPT = `You are a parameter extractor for a GPU provisioning service.
+Extract the following from the user's message and return JSON:
+- "action": either "create" (provision a new GPU pod) or "status" (check status of an existing pod). Default "create". (required)
+- "gpu": GPU type, one of "RTX_A4000", "RTX_3090", "RTX_4090", "A100_80GB". Default "RTX_A4000". (optional)
+- "image": Docker image to use. (optional)
+- "disk_gb": container disk size in GB, 5-100. Default 20. (optional)
+- "pod_id": the pod ID to check status for. Required if action is "status". (optional)
+
+Return ONLY valid JSON, no explanation.
+Examples:
+- {"action": "create", "gpu": "RTX_4090"}
+- {"action": "status", "pod_id": "abc123"}
+- {"action": "create", "gpu": "A100_80GB", "disk_gb": 50}`;
+
+const ROUTES = {
+  "POST /": {
+    accepts: [{ scheme: "exact", price: "$1.00", network: "eip155:8453", payTo: "0x0" as `0x${string}` }],
+    description: "Provision an on-demand GPU instance or check pod status. Send {\"input\": \"your request\"}",
+    mimeType: "application/json",
+    extensions: {
+      bazaar: {
+        info: {
+          input: {
+            type: "http",
+            method: "POST",
+            bodyType: "json",
+            body: {
+              input: { type: "string", description: "Describe what you want: create a GPU pod or check status of an existing one", required: true },
+            },
+          },
+          output: { type: "json" },
+        },
+        schema: {
+          properties: {
+            input: {
+              properties: { method: { type: "string", enum: ["POST"] } },
+              required: ["method"],
+            },
+          },
+        },
+      },
     },
-    servers: [{ url: "https://gpu.camelai.io" }],
   },
-}));
-
-// === x402 payment gates ===
+};
 
 app.use(
-  cdpPaymentMiddleware(
-    (env) => ({
-      "POST /create": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$1.00",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description: "Provision an on-demand GPU instance. Pay, get a GPU, use it.",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              bodyFields: {
-                gpu: {
-                  type: "string",
-                  description:
-                    "GPU type: RTX_A4000, RTX_3090, RTX_4090, or A100_80GB (default: RTX_A4000)",
-                  required: false,
-                },
-                image: {
-                  type: "string",
-                  description: "Docker image (default: pytorch with CUDA)",
-                  required: false,
-                },
-                disk_gb: {
-                  type: "number",
-                  description: "Container disk size in GB (default: 20)",
-                  required: false,
-                },
-              },
-            },
-          },
-        },
-      },
-      "GET /status/:pod_id": {
-        accepts: [
-          {
-            scheme: "exact",
-            price: "$0.001",
-            network: "eip155:8453",
-            payTo: env.SERVER_ADDRESS as `0x${string}`,
-          },
-        ],
-        description: "Check the status of a GPU pod",
-        mimeType: "application/json",
-        extensions: {
-          bazaar: {
-            discoverable: true,
-            inputSchema: {
-              pathFields: {
-                pod_id: {
-                  type: "string",
-                  description: "The pod ID returned from /create",
-                  required: true,
-                },
-              },
-            },
-          },
-        },
-      },
-    })
-  )
+  cdpPaymentMiddleware((env) => ({
+    "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
+  }))
 );
 
-// === POST /create ===
+app.post("/", async (c) => {
+  const body = await c.req.json<{ input?: string }>();
+  if (!body?.input) {
+    return c.json({ error: "Missing 'input' field" }, 400);
+  }
 
-app.post("/create", describeRoute({
-  description: "Provision an on-demand GPU instance. Requires x402 payment ($1.00).",
-  requestBody: {
-    content: {
-      "application/json": {
-        schema: {
-          type: "object",
-          properties: {
-            gpu: { type: "string", description: "GPU type: RTX_A4000, RTX_3090, RTX_4090, or A100_80GB" },
-            image: { type: "string", description: "Docker image (default: pytorch with CUDA)" },
-            disk_gb: { type: "number", description: "Container disk size in GB (default: 20)" },
-          },
-        },
-      },
-    },
-  },
-  responses: {
-    200: { description: "GPU pod created", content: { "application/json": { schema: { type: "object" } } } },
-    400: { description: "Invalid GPU type" },
-    402: { description: "Payment required" },
-    502: { description: "Failed to create GPU pod" },
-  },
-}), async (c) => {
-  const body = await c.req.json().catch(() => ({}));
+  const params = await extractParams(c.env.CF_GATEWAY_TOKEN, SYSTEM_PROMPT, body.input);
+  const action = ((params.action as string) || "create").toLowerCase();
+
+  if (action === "status") {
+    const podId = params.pod_id as string;
+    if (!podId) {
+      return c.json({ error: "Could not determine pod_id to check status" }, 400);
+    }
+    const provider = getProvider(c.env);
+    try {
+      const result = await provider.status(c.env, podId);
+      return c.json(result);
+    } catch (err: any) {
+      const status = err.message.includes("not found") ? 404 : 502;
+      return c.json({ error: err.message }, status);
+    }
+  }
+
+  // Default: create
   const provider = getProvider(c.env);
 
-  const gpuKey = (body.gpu as string) || "RTX_A4000";
+  const gpuKey = (params.gpu as string) || "RTX_A4000";
   if (!provider.gpus[gpuKey]) {
     return c.json(
       { error: `Invalid GPU type '${gpuKey}'. Must be one of: ${Object.keys(provider.gpus).join(", ")}` },
@@ -295,8 +263,8 @@ app.post("/create", describeRoute({
     );
   }
 
-  const image = (body.image as string) || provider.defaultImage;
-  const diskGb = Math.min(Math.max(Number(body.disk_gb) || 20, 5), 100);
+  const image = (params.image as string) || provider.defaultImage;
+  const diskGb = Math.min(Math.max(Number(params.disk_gb) || 20, 5), 100);
 
   try {
     const result = await provider.create(c.env, { gpu: gpuKey, image, disk_gb: diskGb });
@@ -306,36 +274,9 @@ app.post("/create", describeRoute({
   }
 });
 
-// === GET /status/:pod_id ===
-
-app.get("/status/:pod_id", describeRoute({
-  description: "Check the status of a GPU pod. Requires x402 payment ($0.001).",
-  responses: {
-    200: { description: "Pod status", content: { "application/json": { schema: { type: "object" } } } },
-    402: { description: "Payment required" },
-    404: { description: "Pod not found" },
-    502: { description: "Provider API error" },
-  },
-}), async (c) => {
-  const provider = getProvider(c.env);
-  try {
-    const result = await provider.status(c.env, c.req.param("pod_id"));
-    return c.json(result);
-  } catch (err: any) {
-    const status = err.message.includes("not found") ? 404 : 502;
-    return c.json({ error: err.message }, status);
-  }
-});
-
 // === DELETE /destroy/:pod_id (free) ===
 
-app.delete("/destroy/:pod_id", describeRoute({
-  description: "Terminate a GPU pod (free).",
-  responses: {
-    200: { description: "Pod destroyed", content: { "application/json": { schema: { type: "object" } } } },
-    502: { description: "Failed to destroy pod" },
-  },
-}), async (c) => {
+app.delete("/destroy/:pod_id", async (c) => {
   const provider = getProvider(c.env);
   try {
     await provider.destroy(c.env, c.req.param("pod_id"));
@@ -345,24 +286,19 @@ app.delete("/destroy/:pod_id", describeRoute({
   }
 });
 
-// === Health ===
+app.get("/.well-known/openapi.json", openapiFromMiddleware("x402 GPU", "gpu.camelai.io", ROUTES));
 
-app.get("/", describeRoute({
-  description: "Health check and service info.",
-  responses: {
-    200: { description: "Service info", content: { "application/json": { schema: { type: "object" } } } },
-  },
-}), (c) => {
+app.get("/", (c) => {
   const provider = getProvider(c.env);
   return c.json({
     service: "x402-gpu",
-    description: "On-demand GPU instances. Pay via x402, get a GPU pod.",
+    description: 'On-demand GPU instances. Send POST / with {"input": "create an RTX 4090 pod"}',
     provider: c.env.PROVIDER || "runpod",
     available_providers: Object.keys(providers),
     gpu_options: Object.keys(provider.gpus),
+    price: "$1.00 per request (Base mainnet)",
     endpoints: {
-      "POST /create": "$1.00",
-      "GET /status/:pod_id": "$0.001",
+      "POST /": "$1.00",
       "DELETE /destroy/:pod_id": "free",
     },
   });
