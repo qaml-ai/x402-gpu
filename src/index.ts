@@ -194,7 +194,11 @@ Examples:
 
 const ROUTES = {
   "POST /": {
-    accepts: [{ scheme: "exact", price: "$1.00", network: "eip155:8453", payTo: "0x0" as `0x${string}` }],
+    accepts: [
+      { scheme: "exact", price: "$1.00", network: "eip155:8453", payTo: "0x0" as `0x${string}` },
+      { scheme: "exact", price: "$1.00", network: "eip155:137", payTo: "0x0" as `0x${string}` },
+      { scheme: "exact", price: "$1.00", network: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", payTo: "CvraJ4avKPpJNLvMhMH5ip2ihdt85PXvDwfzXdziUxRq" },
+    ],
     description: "Provision an on-demand GPU instance or check pod status. Send {\"input\": \"your request\"}",
     mimeType: "application/json",
     extensions: {
@@ -228,7 +232,7 @@ app.use(stripeApiKeyMiddleware({ serviceName: "gpu" }));
 app.use(async (c, next) => {
   if (c.get("skipX402")) return next();
   return cdpPaymentMiddleware((env) => ({
-    "POST /": { ...ROUTES["POST /"], accepts: [{ ...ROUTES["POST /"].accepts[0], payTo: env.SERVER_ADDRESS as `0x${string}` }] },
+    "POST /": { ...ROUTES["POST /"], accepts: ROUTES["POST /"].accepts.map((a: any) => ({ ...a, payTo: a.network.startsWith("solana") ? a.payTo : env.SERVER_ADDRESS as `0x${string}` })) },
   }))(c, next);
 });
 
